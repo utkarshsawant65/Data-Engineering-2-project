@@ -1,1 +1,0 @@
-2024-12-06 10:47:42.698438: Added 3996 new rows to apple_stock_data.csv
