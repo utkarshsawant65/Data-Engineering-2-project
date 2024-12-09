@@ -1,0 +1,12 @@
+google-cloud-pubsub
+google-cloud-storage
+google-cloud-bigquery
+pandas
+requests
+schedule
+python-dotenv
+streamlit
+db-dtypes
+plotly
+pandas-gbq
+pandas_gbq
