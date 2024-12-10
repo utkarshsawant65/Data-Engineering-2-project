@@ -1,0 +1,24 @@
+services:
+  gcloud:
+    image: google/cloud-sdk:latest
+    container_name: gcloud
+    volumes:
+      - ./gcloud:/workspace
+      - ./keys:/workspace/keys
+    working_dir: /workspace
+    tty: true
+    entrypoint: /bin/bash
+
+  python:
+    image: python:3.9-slim
+    container_name: python
+    volumes:
+      - ./python-scripts:/workspace
+      - ./keys:/workspace/keys
+    working_dir: /workspace
+    tty: true
+    environment:
+      - GOOGLE_APPLICATION_CREDENTIALS=/workspace/keys/service_account.json
+    ports:
+      - "8501:8501"
+    command: /bin/bash
