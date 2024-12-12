@@ -1,353 +1,281 @@
-import time
 from datetime import datetime, timedelta
 
+import numpy as np
 import pandas as pd
-import pandas_gbq
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 from config import GCP_CONFIG, STOCK_CONFIGS
-from google.cloud import bigquery
-
-
-# Update the time window configurations in the fetch_stock_data function
-@st.cache_data(ttl=300)  # Cache data for 5 minutes
-def fetch_stock_data(symbol, time_window, table_type, dataset):
-    """
-    Get stock data from BigQuery with focus on real-time data
-    time_window: 'recent', '1w', '1m'
-    """
-    window_configs = {
-        "recent": "LIMIT 100",  # Most recent 100 records
-        "1w": "AND timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)",
-        "1m": "AND timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)",
-    }
-
-    time_filter = window_configs.get(time_window, window_configs["recent"])
-    table_suffix = "_processed" if table_type == "processed" else "_raw"
-
-    query = f"""
-    SELECT *
-    FROM {dataset}.{STOCK_CONFIGS[symbol]['table_name']}{table_suffix}
-    WHERE 1=1 
-    {time_filter if time_window != 'recent' else ''}
-    ORDER BY timestamp DESC
-    {' ' + time_filter if time_window == 'recent' else ''}
-    """
-
-    try:
-        data = pandas_gbq.read_gbq(
-            query, project_id=GCP_CONFIG["PROJECT_ID"], progress_bar_type=None
-        )
-
-        if not data.empty:
-            data["timestamp"] = pd.to_datetime(data["timestamp"])
-            data = data.sort_values("timestamp")
-
-        return data
-
-    except Exception as e:
-        st.error(f"Error fetching data for {symbol}: {str(e)}")
-        return pd.DataFrame()
+from google.cloud import bigquery, bigquery_storage
 
 
 class StockDashboard:
     def __init__(self):
         self.client = bigquery.Client()
-        self.dataset = f"{GCP_CONFIG['PROJECT_ID']}.{GCP_CONFIG['DATASET_NAME']}"
+        self.bqstorage_client = bigquery_storage.BigQueryReadClient()
+        self.available_symbols = list(STOCK_CONFIGS.keys())
 
-    def get_stock_data(self, symbol, time_window="recent", table_type="processed"):
-        return fetch_stock_data(symbol, time_window, table_type, self.dataset)
-
-    def calculate_metrics(self, data):
-        if data.empty:
-            return None
-
-        try:
-            latest = data.iloc[-1]
-            prev_close = (
-                data.iloc[-2]["close"] if len(data) > 1 else data.iloc[0]["open"]
-            )
-
-            return {
-                "current_price": latest["close"],
-                "day_change": (latest["close"] - prev_close) / prev_close * 100,
-                "day_volume": latest["volume"],
-                "ma7": latest.get("ma7", latest["close"]),
-                "ma20": latest.get("ma20", latest["close"]),
-                "volatility": latest.get("volatility", 0),
-                "momentum": latest.get("momentum", 0),
-                "last_update": latest["timestamp"],
-            }
-        except Exception as e:
-            st.warning(f"Error calculating metrics: {str(e)}")
-            return None
-
-
-def create_price_chart(data):
-    """Create candlestick chart with moving averages"""
-    fig = go.Figure()
-
-    fig.add_trace(
-        go.Candlestick(
-            x=data["timestamp"],
-            open=data["open"],
-            high=data["high"],
-            low=data["low"],
-            close=data["close"],
-            name="OHLC",
+    def load_data(self, symbol: str, days: int = 7) -> pd.DataFrame:
+        """Load data from BigQuery for a specific symbol"""
+        query = f"""
+        SELECT 
+            FORMAT_TIMESTAMP('%Y-%m-%d %H:%M:%S', timestamp) as timestamp_str,
+            symbol,
+            open,
+            high,
+            low,
+            close,
+            volume,
+            FORMAT_DATE('%Y-%m-%d', CAST(date AS DATE)) as date_str,
+            FORMAT_TIME('%H:%M:%S', CAST(time AS TIME)) as time_str,
+            moving_average,
+            cumulative_average
+        FROM `{GCP_CONFIG['PROJECT_ID']}.{GCP_CONFIG['DATASET_NAME']}.{STOCK_CONFIGS[symbol]['table_name']}`
+        WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {days} DAY)
+        ORDER BY timestamp
+        """
+        df = self.client.query(query).to_dataframe(
+            bqstorage_client=self.bqstorage_client
         )
-    )
 
-    if "ma7" in data.columns:
+        # Convert timestamps with explicit formats
+        df["timestamp"] = pd.to_datetime(
+            df["timestamp_str"], format="%Y-%m-%d %H:%M:%S"
+        )
+        df["date"] = pd.to_datetime(df["date_str"], format="%Y-%m-%d")
+        df["time"] = pd.to_datetime(df["time_str"], format="%H:%M:%S").dt.time
+
+        # Drop string columns
+        df = df.drop(["timestamp_str", "date_str", "time_str"], axis=1)
+
+        return df
+
+    def calculate_vwap(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Calculate VWAP for the dataset"""
+        df["vwap"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
+        return df
+
+    def create_candlestick_chart(self, df: pd.DataFrame) -> go.Figure:
+        """Create a candlestick chart with volume bars"""
+        fig = go.Figure()
+
+        # Add candlestick
+        fig.add_trace(
+            go.Candlestick(
+                x=df["timestamp"],
+                open=df["open"],
+                high=df["high"],
+                low=df["low"],
+                close=df["close"],
+                name="OHLC",
+            )
+        )
+
+        # Add volume bars on secondary y-axis
+        fig.add_trace(
+            go.Bar(
+                x=df["timestamp"],
+                y=df["volume"],
+                name="Volume",
+                yaxis="y2",
+                opacity=0.3,
+            )
+        )
+
+        # Update layout
+        fig.update_layout(
+            title="Stock Price & Volume",
+            yaxis_title="Price",
+            yaxis2=dict(title="Volume", overlaying="y", side="right"),
+            xaxis_title="Date",
+            height=600,
+        )
+
+        return fig
+
+    def create_ma_chart(self, df: pd.DataFrame) -> go.Figure:
+        """Create moving averages chart"""
+        fig = go.Figure()
+
+        # Add close price
         fig.add_trace(
             go.Scatter(
-                x=data["timestamp"],
-                y=data["ma7"],
-                name="MA7",
-                line=dict(color="blue", width=1),
+                x=df["timestamp"],
+                y=df["close"],
+                name="Close Price",
+                line=dict(color="blue"),
             )
         )
 
-    if "ma20" in data.columns:
+        # Add moving averages
         fig.add_trace(
             go.Scatter(
-                x=data["timestamp"],
-                y=data["ma20"],
-                name="MA20",
-                line=dict(color="orange", width=1),
+                x=df["timestamp"],
+                y=df["moving_average"],
+                name="5-period MA",
+                line=dict(color="orange"),
             )
         )
 
-    fig.update_layout(
-        title="Real-time Price Movement with Moving Averages",
-        yaxis_title="Price (USD)",
-        xaxis_title="Time",
-        height=600,
-        template="plotly_white",
-    )
-
-    return fig
-
-
-def create_volume_chart(data):
-    """Create volume chart with moving average"""
-    fig = go.Figure()
-
-    fig.add_trace(
-        go.Bar(
-            x=data["timestamp"],
-            y=data["volume"],
-            name="Volume",
-            marker_color="lightblue",
-        )
-    )
-
-    if "volume_ma5" in data.columns:
         fig.add_trace(
             go.Scatter(
-                x=data["timestamp"],
-                y=data["volume_ma5"],
-                name="Volume MA5",
-                line=dict(color="red", width=2),
+                x=df["timestamp"],
+                y=df["cumulative_average"],
+                name="Cumulative MA",
+                line=dict(color="green"),
             )
         )
 
-    fig.update_layout(
-        title="Real-time Trading Volume Analysis",
-        yaxis_title="Volume",
-        xaxis_title="Time",
-        height=400,
-        template="plotly_white",
-    )
+        fig.update_layout(
+            title="Moving Averages Analysis",
+            yaxis_title="Price",
+            xaxis_title="Date",
+            height=500,
+        )
 
-    return fig
+        return fig
+
+    def create_daily_range_box(self, df: pd.DataFrame) -> go.Figure:
+        """Create box plot of daily price ranges"""
+        df["range"] = df["high"] - df["low"]
+        df["week"] = df["date"].dt.strftime("%Y-%U")
+
+        fig = px.box(df, x="week", y="range", title="Weekly Price Range Distribution")
+
+        fig.update_layout(xaxis_title="Week", yaxis_title="Price Range", height=400)
+
+        return fig
+
+    def create_price_change_hist(self, df: pd.DataFrame) -> go.Figure:
+        """Create histogram of price changes"""
+        df["change_pct"] = ((df["close"] - df["open"]) / df["open"]) * 100
+
+        fig = px.histogram(
+            df, x="change_pct", nbins=50, title="Distribution of Daily Price Changes"
+        )
+
+        fig.update_layout(
+            xaxis_title="Price Change (%)", yaxis_title="Frequency", height=400
+        )
+
+        return fig
+
+    def create_volume_heatmap(self, df: pd.DataFrame) -> go.Figure:
+        """Create volume heatmap by hour and day"""
+        # Convert time objects to hour integers directly
+        df["hour"] = df["time"].apply(lambda x: x.hour)
+        df["day"] = df["date"].dt.strftime("%A")
+
+        volume_pivot = df.pivot_table(
+            values="volume", index="day", columns="hour", aggfunc="mean"
+        )
+
+        fig = px.imshow(
+            volume_pivot,
+            title="Volume Heatmap by Hour and Day",
+            labels=dict(x="Hour of Day", y="Day of Week", color="Volume"),
+        )
+
+        fig.update_layout(height=400)
+        return fig
+
+    def create_vwap_chart(self, df: pd.DataFrame) -> go.Figure:
+        """Create VWAP chart"""
+        df = self.calculate_vwap(df)
+
+        fig = go.Figure()
+
+        fig.add_trace(
+            go.Scatter(
+                x=df["timestamp"],
+                y=df["close"],
+                name="Close Price",
+                line=dict(color="blue"),
+            )
+        )
+
+        fig.add_trace(
+            go.Scatter(
+                x=df["timestamp"], y=df["vwap"], name="VWAP", line=dict(color="red")
+            )
+        )
+
+        fig.update_layout(
+            title="Price vs VWAP", yaxis_title="Price", xaxis_title="Date", height=400
+        )
+
+        return fig
 
 
 def main():
     st.set_page_config(
-        page_title="Real-time Stock Market Dashboard",
-        layout="wide",
-        initial_sidebar_state="expanded",
+        page_title="Stock Market Dashboard", page_icon="📈", layout="wide"
     )
 
-    # Custom CSS
-    st.markdown(
-        """
-        <style>
-        .stAlert {
-            font-size: 16px;
-            margin: 20px 0;
-        }
-        .metric-card {
-            background-color: #f0f2f6;
-            padding: 10px;
-            border-radius: 5px;
-        }
-        </style>
-    """,
-        unsafe_allow_html=True,
-    )
+    st.title("Stock Market Analysis Dashboard")
 
+    # Initialize dashboard
     dashboard = StockDashboard()
 
-    # Sidebar Controls
-    st.sidebar.title("📊 Dashboard Controls")
-
-    # Update time window options
-    time_windows = {
-        "Real-time (Latest 100 records)": "recent",
-        "Last Week": "1w",
-        "Last Month": "1m",
-    }
-    selected_window = st.sidebar.selectbox(
-        "Select Time Window", list(time_windows.keys())
-    )
-    time_window = time_windows[selected_window]
-    selected_stock = st.sidebar.selectbox("Select Stock", list(STOCK_CONFIGS.keys()))
-
-    view_type = st.sidebar.radio(
-        "Select View Type",
-        ["Technical Analysis", "Volume Analysis", "Comparative Analysis"],
+    # Sidebar controls
+    st.sidebar.header("Controls")
+    selected_symbol = st.sidebar.selectbox(
+        "Select Stock Symbol", dashboard.available_symbols
     )
 
-    auto_refresh = st.sidebar.checkbox("Enable Auto-refresh", value=False)
-    if auto_refresh:
-        refresh_interval = st.sidebar.slider(
-            "Refresh Interval (seconds)", min_value=5, max_value=300, value=60
-        )
-        st.sidebar.info(f"Data will refresh every {refresh_interval} seconds")
+    days_to_load = st.sidebar.slider("Days of Data", min_value=1, max_value=30, value=7)
 
-    st.title(f"📈 Real-time Stock Analysis - {selected_stock}")
+    # Load data
+    try:
+        df = dashboard.load_data(selected_symbol, days_to_load)
 
-    def load_and_display_data():
-        with st.spinner("Loading real-time data..."):
-            processed_data = dashboard.get_stock_data(
-                selected_stock, time_window, "processed"
+        if df.empty:
+            st.error("No data available for the selected period.")
+            return
+
+        # Main dashboard layout
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.subheader("Price Overview")
+            latest = df.iloc[-1]
+            st.metric(
+                "Current Price",
+                f"${latest['close']:.2f}",
+                f"{((latest['close'] - latest['open']) / latest['open'] * 100):.2f}%",
             )
 
-            if processed_data.empty:
-                st.info(
-                    f"No recent data available for {selected_stock}. This might be due to market hours or data loading."
-                )
-                return
+        with col2:
+            st.subheader("Volume Overview")
+            avg_volume = df["volume"].mean()
+            st.metric(
+                "Average Volume",
+                f"{int(avg_volume):,}",
+                f"{((df['volume'].iloc[-1] - avg_volume) / avg_volume * 100):.2f}%",
+            )
 
-            # Display metrics
-            metrics = dashboard.calculate_metrics(processed_data)
-            if metrics:
-                col1, col2, col3, col4, col5 = st.columns(5)
-                with col1:
-                    st.metric(
-                        "Current Price",
-                        f"${metrics['current_price']:.2f}",
-                        f"{metrics['day_change']:.2f}%",
-                    )
-                with col2:
-                    st.metric("Volume", f"{metrics['day_volume']:,}")
-                with col3:
-                    st.metric("MA7", f"${metrics['ma7']:.2f}")
-                with col4:
-                    st.metric("Volatility", f"{metrics['volatility']:.2f}%")
-                with col5:
-                    st.metric(
-                        "Last Update", metrics["last_update"].strftime("%H:%M:%S")
-                    )
+        # Charts
+        st.plotly_chart(
+            dashboard.create_candlestick_chart(df), use_container_width=True
+        )
+        st.plotly_chart(dashboard.create_ma_chart(df), use_container_width=True)
 
-            # Technical Analysis View
-            if view_type == "Technical Analysis":
-                st.plotly_chart(
-                    create_price_chart(processed_data), use_container_width=True
-                )
+        col3, col4 = st.columns(2)
+        with col3:
+            st.plotly_chart(
+                dashboard.create_daily_range_box(df), use_container_width=True
+            )
+        with col4:
+            st.plotly_chart(
+                dashboard.create_price_change_hist(df), use_container_width=True
+            )
 
-                col1, col2 = st.columns(2)
-                with col1:
-                    if "daily_return" in processed_data.columns:
-                        fig_returns = px.line(
-                            processed_data,
-                            x="timestamp",
-                            y="daily_return",
-                            title="Returns (%)",
-                        )
-                        st.plotly_chart(fig_returns, use_container_width=True)
+        st.plotly_chart(dashboard.create_volume_heatmap(df), use_container_width=True)
+        st.plotly_chart(dashboard.create_vwap_chart(df), use_container_width=True)
 
-                with col2:
-                    if "momentum" in processed_data.columns:
-                        fig_momentum = px.line(
-                            processed_data,
-                            x="timestamp",
-                            y="momentum",
-                            title="Momentum",
-                        )
-                        st.plotly_chart(fig_momentum, use_container_width=True)
-
-            # Volume Analysis View
-            elif view_type == "Volume Analysis":
-                st.plotly_chart(
-                    create_volume_chart(processed_data), use_container_width=True
-                )
-
-                fig_vol_dist = px.histogram(
-                    processed_data, x="volume", nbins=50, title="Volume Distribution"
-                )
-                st.plotly_chart(fig_vol_dist, use_container_width=True)
-
-            # Comparative Analysis View
-            else:
-                comparison_df = pd.DataFrame()
-
-                for symbol in STOCK_CONFIGS.keys():
-                    stock_data = dashboard.get_stock_data(
-                        symbol, time_window, "processed"
-                    )
-                    if not stock_data.empty:
-                        first_price = stock_data["close"].iloc[0]
-                        comparison_df[symbol] = (
-                            stock_data["close"] / first_price - 1
-                        ) * 100
-                        comparison_df["timestamp"] = stock_data["timestamp"]
-
-                if not comparison_df.empty:
-                    fig_comparison = px.line(
-                        comparison_df,
-                        x="timestamp",
-                        y=[col for col in comparison_df.columns if col != "timestamp"],
-                        title="Relative Performance Comparison (%)",
-                        height=500,
-                    )
-                    st.plotly_chart(fig_comparison, use_container_width=True)
-
-                    correlation = comparison_df.drop("timestamp", axis=1).corr()
-                    fig_corr = px.imshow(
-                        correlation,
-                        title="Price Correlation Matrix",
-                        color_continuous_scale="RdBu",
-                    )
-                    st.plotly_chart(fig_corr, use_container_width=True)
-
-            # Statistical Summary
-            with st.expander("Statistical Summary"):
-                st.dataframe(processed_data.describe())
-
-    # Initial load
-    load_and_display_data()
-
-    # Auto-refresh loop
-    if auto_refresh:
-        placeholder = st.empty()
-        while True:
-            time.sleep(refresh_interval)
-            with placeholder.container():
-                load_and_display_data()
-
-    # Footer
-    st.markdown("---")
-    now = datetime.now()
-    st.markdown(
-        f"""
-        Last dashboard update: {now.strftime("%Y-%m-%d %H:%M:%S")}  
-        Data refreshes every {refresh_interval if auto_refresh else 5} seconds
-    """
-    )
+    except Exception as e:
+        st.error(f"Error loading data: {str(e)}")
+        st.exception(e)  # This will show the full traceback
 
 
 if __name__ == "__main__":
