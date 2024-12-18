@@ -53,6 +53,16 @@ STOCK_CONFIGS = {
         "table_name": "apple_stock",
         "interval": "5min",
     },
+    "MSFT": {
+        "api_key": "DYDIKRBOWNRQ9CUA",
+        "table_name": "microsoft_stock",
+        "interval": "5min",
+    },
+    "GOOGL": {
+        "api_key": "DYDIKRBOWNRQ9CUA",
+        "table_name": "google_stock",
+        "interval": "5min",
+    },
 }
 
 
