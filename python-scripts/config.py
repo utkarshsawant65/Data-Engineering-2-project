@@ -63,6 +63,16 @@ STOCK_CONFIGS = {
         "table_name": "google_stock",
         "interval": "5min",
     },
+    "F": {
+        "api_key": "J30SRXLUMQK4EW8Y",
+        "table_name": "ford_stock",
+        "interval": "5min",
+    },
+    "GM": {
+        "api_key": "J30SRXLUMQK4EW8Y",
+        "table_name": "general_motors_stock",
+        "interval": "5min",
+    },
 }
 
 
